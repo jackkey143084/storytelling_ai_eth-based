@@ -1,0 +1,6 @@
+go-service/contract/StoryNFT.abi.json
+
+ABI, сгенерированный после компиляции контракта Hardhat — положите сюда ABI (Hardhat compilation создаст artifacts).
+  Для простоты можно поместить ABI ручным способом после компиляции.
+  
+rust-client: ipfs_upload.rs (пример использования IPFS HTTP API)
