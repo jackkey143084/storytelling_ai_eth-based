@@ -1,0 +1,58 @@
+version: "3.7"
+services:
+  geth:
+    image: ethereum/client-go:stable
+    command:
+      - --dev
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.vhosts=*
+      - --http.api=eth,net,web3,personal,txpool
+      - --http.corsdomain=*
+      - --allow-insecure-unlock
+      - --miner.threads=1
+      - --verbosity=3
+    volumes:
+      - ./infra/geth:/root/.ethereum
+    ports:
+      - "8545:8545"
+    networks:
+      - localnet
+
+  ipfs:
+    image: ipfs/go-ipfs:latest
+    ports:
+      - "5001:5001"   # API
+      - "8080:8080"   # gateway
+      - "4001:4001"
+    networks:
+      - localnet
+
+  go-service:
+    build: ./go-service
+    environment:
+      - GETH_RPC=http://geth:8545
+      - PRIVATE_KEY_PATH=/app/keys/dev_account.key
+      - CONTRACT_ADDRESS=
+    ports:
+      - "8081:8081"
+    depends_on:
+      - geth
+      - ipfs
+    networks:
+      - localnet
+
+  hardhat:
+    image: node:18
+    working_dir: /work
+    volumes:
+      - ./infra/hardhat:/work
+    command: ["bash", "-lc", "npm install && npx hardhat node --hostname 0.0.0.0 --port 8546"]
+    ports:
+      - "8546:8546"
+    networks:
+      - localnet
+
+networks:
+  localnet:
+    driver: bridge
