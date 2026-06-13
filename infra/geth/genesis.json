@@ -1,1 +1,8 @@
+{
+  "config": { "chainId": 1337, "homesteadBlock": 0, "eip150Block": 0, "eip155Block": 0, "eip158Block": 0 },
+  "alloc": {}, "coinbase": "0x0000000000000000000000000000000000000000",
+  "difficulty": "0x1", "extraData": "", "gasLimit": "0x2fefd8",
+  "nonce": "0x0000000000000042", "mixhash":"0x000...000", "parentHash":"0x000...0000", "timestamp":"0x00"
+}
+
 
