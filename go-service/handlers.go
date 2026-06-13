@@ -7,162 +7,148 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net/http"
+	"math/big"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	shell "github.com/ipfs/go-ipfs-api"
+
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	ethclient "github.com/ethereum/go-ethereum/ethclient"
-	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+
+	"go-service/contract" // generated via abigen -> package contract
 )
 
-// Request payload from Rust service
 type MintRequest struct {
 	ToAddress     string `json:"to_address"`
 	IpfsCid       string `json:"ipfs_cid"`
-	CheckpointHex string `json:"checkpoint"` // hex string of checkpoint hash (32 bytes)
+	CheckpointHex string `json:"checkpoint"` // 64 hex chars
 	Nonce         *uint64 `json:"nonce,omitempty"`
 }
 
-// environment vars:
-// GETH_RPC (http://geth:8545), PRIVATE_KEY_PATH (path inside container), CONTRACT_ADDRESS
+func trimHexPrefix(s string) string {
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		return s[2:]
+	}
+	return s
+}
+
+func trimNewline(s string) string {
+	return strings.TrimSpace(s)
+}
+
 func MintHandler(c *gin.Context) {
 	var req MintRequest
 	if err := c.BindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 	geth := os.Getenv("GETH_RPC")
 	if geth == "" { geth = "http://geth:8545" }
 	contractAddr := os.Getenv("CONTRACT_ADDRESS")
 	if contractAddr == "" {
-		c.JSON(http.StatusInternalServerError, gin.H{"error":"CONTRACT_ADDRESS not set in env"})
+		c.JSON(500, gin.H{"error":"CONTRACT_ADDRESS not set in env"})
 		return
 	}
 
-	// 1) Validate/resolve IPFS CID — optional: ping IPFS API
+	// optional: ping IPFS
 	ipfs := shell.NewShell("http://ipfs:5001")
 	_, err := ipfs.ObjectStat(req.IpfsCid)
 	if err != nil {
-		// not found or error
-		log.Printf("ipfs stat error: %v", err)
-		// proceed anyway
+		log.Printf("ipfs stat error (continue): %v", err)
 	}
 
-	// 2) connect to geth
 	client, err := ethclient.Dial(geth)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed dial geth: " + err.Error()})
+		c.JSON(500, gin.H{"error":"failed dial geth: " + err.Error()})
 		return
 	}
 
-	// 3) load private key
+	// load private key
 	privPath := os.Getenv("PRIVATE_KEY_PATH")
 	privKeyBytes, err := ioutil.ReadFile(privPath)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error":"failed read private key:" + err.Error()})
+		c.JSON(500, gin.H{"error":"failed read private key:" + err.Error()})
 		return
 	}
-	privKeyHex := string(privKeyBytes)
-	privKeyHex = trimNewline(privKeyHex)
+	privKeyHex := trimNewline(string(privKeyBytes))
 	privKey, err := crypto.HexToECDSA(privKeyHex)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error":"invalid private key: " + err.Error()})
+		c.JSON(500, gin.H{"error":"invalid private key: " + err.Error()})
 		return
 	}
 	publicKey := privKey.Public()
 	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error":"invalid public key"})
+		c.JSON(500, gin.H{"error":"invalid public key"})
 		return
 	}
 	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
 
-	// 4) prepare auth
-	chainID, err := client.NetworkID(context.Background())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "fail network id: " + err.Error()})
-		return
-	}
-	auth, err := bind.NewKeyedTransactorWithChainID(privKey, chainID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error":"transactor error: " + err.Error()})
-		return
-	}
-
-	// optional: set gas params / nonce
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// load contract ABI & address
-	contractAddress := common.HexToAddress(contractAddr)
-	// Use generated Go bindings ideally; here we use generic ABI binding call
-	// For simplicity, we will call via low-level Transact with ABI encoded data.
-	abiBytes, err := ioutil.ReadFile("contract/StoryNFT.abi.json")
+	chainID, err := client.NetworkID(ctx)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error":"abi read error: " + err.Error()})
-		return
-	}
-	// build ABI method call
-	parsedABI, err := abi.JSON(strings.NewReader(string(abiBytes)))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error":"abi parse error: "+err.Error()})
+		c.JSON(500, gin.H{"error":"fail network id: " + err.Error()})
 		return
 	}
 
-	// pack inputs: mintStory(address to, string cid, bytes32 checkpoint)
-	toAddr := common.HexToAddress(req.ToAddress)
-	checkpointBytes, err := hex.DecodeString(trimHexPrefix(req.CheckpointHex))
-	if err != nil || len(checkpointBytes) != 32 {
-		c.JSON(http.StatusBadRequest, gin.H{"error":"checkpoint must be 32-byte hex"})
+	// prepare transactor
+	auth, err := bind.NewKeyedTransactorWithChainID(privKey, chainID)
+	if err != nil {
+		c.JSON(500, gin.H{"error":"transactor error: " + err.Error()})
 		return
 	}
-	input, err := parsedABI.Pack("mintStory", toAddr, req.IpfsCid, [32]byte{})
-	if err != nil {
-		// build proper 32-byte array
-		var cp [32]byte
-		copy(cp[:], checkpointBytes)
-		input, err = parsedABI.Pack("mintStory", toAddr, req.IpfsCid, cp)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error":"abi pack fail: "+err.Error()})
-			return
-		}
-	}
 
-	nonce := uint64(0)
+	// set nonce/gasprice if needed
 	if req.Nonce != nil {
-		nonce = *req.Nonce
+		auth.Nonce = big.NewInt(int64(*req.Nonce))
 	} else {
-		nonce64, err := client.PendingNonceAt(ctx, fromAddress)
+		nonce, err := client.PendingNonceAt(ctx, fromAddress)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error":"nonce fail: "+err.Error()})
+			c.JSON(500, gin.H{"error":"nonce fetch fail: " + err.Error()})
 			return
 		}
-		nonce = nonce64
+		auth.Nonce = big.NewInt(int64(nonce))
 	}
 	gasPrice, err := client.SuggestGasPrice(ctx)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error":"gas price fail:"+err.Error()})
-		return
+	if err == nil {
+		auth.GasPrice = gasPrice
 	}
-	tx := types.NewTransaction(nonce, contractAddress, big.NewInt(0), uint64(300000), gasPrice, input)
-	signedTx, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), privKey)
+	auth.GasLimit = uint64(300000)
+
+	// load contract binding
+	contractAddress := common.HexToAddress(contractAddr)
+	story, err := contract.NewStoryNFT(contractAddress, client)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error":"sign tx fail:"+err.Error()})
+		c.JSON(500, gin.H{"error":"failed contract binding: " + err.Error()})
 		return
 	}
 
-	err = client.SendTransaction(ctx, signedTx)
+	// prepare checkpoint bytes32
+	cpHex := trimHexPrefix(req.CheckpointHex)
+	cpBytes, err := hex.DecodeString(cpHex)
+	if err != nil || len(cpBytes) != 32 {
+		c.JSON(400, gin.H{"error":"checkpoint must be 32-byte hex (64 hex chars)"})
+		return
+	}
+	var cpArr [32]byte
+	copy(cpArr[:], cpBytes)
+
+	toAddr := common.HexToAddress(req.ToAddress)
+	tx, err := story.MintStory(auth, toAddr, req.IpfsCid, cpArr)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error":"send tx fail:"+err.Error()})
+		c.JSON(500, gin.H{"error":"mint tx failed: " + err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{
-		"tx_hash": signedTx.Hash().Hex(),
+		"tx_hash": tx.Hash().Hex(),
 		"from": fromAddress.Hex(),
 	})
 }
-
